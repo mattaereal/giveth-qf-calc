@@ -13,29 +13,26 @@ Usage:
   python3 giveth_qf_live.py --self-test
 
 QF model:
-  raw_qf_p = (sum sqrt(c_i))^2 across donors i
-  match_component_p = max(raw_qf_p - sum c_i, 0)
-  pre_cap_share_p = pool * (match_component_p / sum_all match_components)
-  capped_p = pre_cap_share_p with iterative cap redistribution
-
-Adjustments:
-  - Donations < MIN_QF_USD ($1) are excluded from matching.
-  - Those small donations still count as raised/direct funding.
-  - FINN priced at ETH/USD / 1000 when valueUsd is unavailable.
-  - TIK priced at $1 when valueUsd is unavailable.
-  - Anonymous donations (no user.id, no fromWalletAddress) are clustered by
-    1-minute timestamp bucket. Same-minute anons are treated as same donor.
-  - Donors holding the ETHSecurity Voting Badge NFT have their contribution
-    multiplied by --nft-multiplier (default 4) inside the QF formula.
+  Giveth variant (default):  match_p = pool * (sum sqrt(c_i))^2 / sum_all (sum sqrt(c_j))^2
+  Standard QF (--qf-formula standard): match_component_p = max((sum sqrt(c_i))^2 - sum c_i, 0)
+  Cap: min(match_p, pool * max_reward) with optional iterative redistribution.
 
 Important:
-  Matching pool and per-project cap are not hardcoded. The script reads
-  allocatedFund, allocatedTokenSymbol, allocatedFundUSD, and maximumReward from
-  the Giveth round API. For ETH/WETH pools, the native pool amount is canonical
-  and USD values are live conversions for comparability with donation valueUsd.
+  This script replicates Giveth's OPEN-SOURCE estimation logic, not their final
+  payout algorithm.  According to Giveth's official documentation, FINAL payouts
+  use Connection-Oriented Cluster Matching (COCM), which clusters donors with
+  similar donation patterns and treats them as fewer unique donors.  COCM is
+  NOT implemented here because it requires cross-project donor similarity
+  analysis and the exact clustering parameters are not public.
 
-  This is an estimator. Giveth final payouts may use COCM, Passport/Sybil
-  weighting, manual disqualifications, and post-round review.
+  See:
+    - Giveth docs: https://docs.giveth.io/quadraticfunding
+    - Forum announcement: https://forum.giveth.io/t/cluster-match-qf-announcement/1419
+    - Paper: "Beyond Collusion Resistance: Leveraging Social Information for
+      Plural Funding and Voting" (SSRN 4311507)
+
+  Other unimplemented factors: Passport/Sybil weighting, manual
+  disqualifications, and post-round review.
 """
 import argparse
 import json
@@ -45,8 +42,10 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import concurrent.futures
 from collections import defaultdict
 from copy import deepcopy
+from datetime import datetime
 
 ENDPOINT = "https://core.v6.giveth.io/graphql"
 BLOCKSCOUT_BASE = "https://eth.blockscout.com/api/v2"
@@ -88,7 +87,7 @@ query DonationsByProject($projectId:Int!,$skip:Int!,$take:Int!,$qfRoundId:Int){
     orderBy:CreatedAt, orderDirection:DESC, qfRoundId:$qfRoundId
   ){
     donations{
-      id amount valueUsd currency createdAt anonymous
+      id amount valueUsd currency createdAt anonymous status
       fromWalletAddress
       user{ id wallets{ address } }
     }
@@ -98,6 +97,13 @@ query DonationsByProject($projectId:Int!,$skip:Int!,$take:Int!,$qfRoundId:Int){
 """
 
 ETH_USD_PRICE = None
+
+
+def _parse_iso8601(value):
+    """Parse an ISO 8601 timestamp to an aware datetime (UTC)."""
+    if value:
+        value = value.replace("Z", "+00:00")
+    return datetime.fromisoformat(value)
 
 
 def _retry_delay(attempt):
@@ -302,67 +308,127 @@ def fetch_donations(project_id, round_id):
         skip += PAGE
 
 
-def aggregate_round(round_id, nft_holders=None, nft_multiplier=1, track_currencies=("FINN", "TIK"), progress=None):
+def _process_project(p, round_id, nft_holders, nft_multiplier, track_currencies, qf_formula, begin_dt, end_dt):
+    """Fetch and aggregate a single project's donations (isolated for threading)."""
+    qf_contribs = defaultdict(float)
+    dwallets = defaultdict(set)
+    raised = 0.0
+    currency_stats = {c: {"amount": 0.0, "count": 0, "donors": set()} for c in track_currencies}
+
+    try:
+        for don in fetch_donations(p["id"], round_id):
+            status = str(don.get("status") or "").lower()
+            if status and status not in ("", "verified"):
+                continue
+            created_at = don.get("createdAt")
+            if created_at and begin_dt and end_dt:
+                try:
+                    don_dt = _parse_iso8601(created_at)
+                    if don_dt < begin_dt or don_dt > end_dt:
+                        continue
+                except Exception:
+                    pass
+
+            value = donation_usd(don)
+            dk = donor_key(don)
+
+            if value > 0:
+                raised += value
+            if value >= MIN_QF_USD:
+                qf_contribs[dk] += value
+
+            dwallets[dk] |= donor_wallets(don)
+
+            cur = (don.get("currency") or "").upper()
+            if cur in currency_stats:
+                try:
+                    currency_stats[cur]["amount"] += float(don.get("amount") or 0)
+                except (TypeError, ValueError):
+                    pass
+                currency_stats[cur]["count"] += 1
+                currency_stats[cur]["donors"].add(dk)
+    except Exception as exc:
+        print(f"  skip {p['title']}: {exc}", file=sys.stderr)
+        return None, currency_stats
+
+    sqrt_sum = 0.0
+    effective_linear = 0.0
+    nft_donor_count = 0
+
+    for dk, amount in qf_contribs.items():
+        is_nft = bool(nft_holders and dwallets[dk] & nft_holders)
+        effective_amount = amount * nft_multiplier if is_nft else amount
+        if is_nft:
+            nft_donor_count += 1
+        sqrt_sum += math.sqrt(effective_amount)
+        effective_linear += effective_amount
+
+    if qf_formula == "standard":
+        match_component = max(sqrt_sum * sqrt_sum - effective_linear, 0.0)
+    else:
+        match_component = sqrt_sum * sqrt_sum
+
+    state_row = {
+        "id": p["id"],
+        "title": p["title"],
+        "slug": p.get("slug", ""),
+        "donors": len(qf_contribs),
+        "raised": raised,
+        "sqrt_sum": sqrt_sum,
+        "boosted_linear": effective_linear,
+        "match_component": match_component,
+        "nft_donor_count": nft_donor_count,
+    }
+    return state_row, currency_stats
+
+
+def aggregate_round(round_id, nft_holders=None, nft_multiplier=1, track_currencies=("FINN", "TIK"), progress=None, qf_formula="giveth", begin_date=None, end_date=None, workers=1):
+    """Fetch and aggregate donations for all projects in a round.
+
+    By default processes projects sequentially (workers=1). When workers > 1,
+    projects are processed in parallel via ThreadPoolExecutor. This is safe
+    because fetch_donations/graphql/_request_json are self-contained and
+    thread-safe with respect to urllib.
+    """
     projects, total = fetch_projects(round_id)
     state = []
     currency_stats = {c: {"amount": 0.0, "count": 0, "donors": set()} for c in track_currencies}
 
-    for i, p in enumerate(projects, 1):
-        if progress:
-            progress(i, total, p["title"])
+    begin_dt = None
+    end_dt = None
+    if begin_date:
+        begin_dt = _parse_iso8601(begin_date)
+    if end_date:
+        end_dt = _parse_iso8601(end_date)
 
-        qf_contribs = defaultdict(float)
-        dwallets = defaultdict(set)
-        raised = 0.0
+    args = (round_id, nft_holders, nft_multiplier, track_currencies, qf_formula, begin_dt, end_dt)
 
-        try:
-            for don in fetch_donations(p["id"], round_id):
-                value = donation_usd(don)
-                dk = donor_key(don)
-
-                if value > 0:
-                    raised += value
-                if value >= MIN_QF_USD:
-                    qf_contribs[dk] += value
-
-                dwallets[dk] |= donor_wallets(don)
-
-                cur = (don.get("currency") or "").upper()
-                if cur in currency_stats:
-                    try:
-                        currency_stats[cur]["amount"] += float(don.get("amount") or 0)
-                    except (TypeError, ValueError):
-                        pass
-                    currency_stats[cur]["count"] += 1
-                    currency_stats[cur]["donors"].add(dk)
-        except Exception as exc:
-            print(f"  skip {p['title']}: {exc}", file=sys.stderr)
-
-        sqrt_sum = 0.0
-        effective_linear = 0.0
-        nft_donor_count = 0
-
-        for dk, amount in qf_contribs.items():
-            is_nft = bool(nft_holders and dwallets[dk] & nft_holders)
-            effective_amount = amount * nft_multiplier if is_nft else amount
-            if is_nft:
-                nft_donor_count += 1
-            sqrt_sum += math.sqrt(effective_amount)
-            effective_linear += effective_amount
-
-        state.append(
-            {
-                "id": p["id"],
-                "title": p["title"],
-                "slug": p.get("slug", ""),
-                "donors": len(qf_contribs),
-                "raised": raised,
-                "sqrt_sum": sqrt_sum,
-                "boosted_linear": effective_linear,
-                "match_component": max(sqrt_sum * sqrt_sum - effective_linear, 0.0),
-                "nft_donor_count": nft_donor_count,
-            }
-        )
+    if workers > 1:
+        completed = 0
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(_process_project, p, *args): p for p in projects}
+            for fut in concurrent.futures.as_completed(futures):
+                result, cur_stats = fut.result()
+                completed += 1
+                if result is not None:
+                    state.append(result)
+                    for c, d in cur_stats.items():
+                        currency_stats[c]["amount"] += d["amount"]
+                        currency_stats[c]["count"] += d["count"]
+                        currency_stats[c]["donors"].update(d["donors"])
+                if progress:
+                    progress(completed, total, result["title"] if result else "")
+    else:
+        for i, p in enumerate(projects, 1):
+            if progress:
+                progress(i, total, p["title"])
+            result, cur_stats = _process_project(p, *args)
+            if result is not None:
+                state.append(result)
+                for c, d in cur_stats.items():
+                    currency_stats[c]["amount"] += d["amount"]
+                    currency_stats[c]["count"] += d["count"]
+                    currency_stats[c]["donors"].update(d["donors"])
 
     return state, currency_stats
 
@@ -499,26 +565,29 @@ def compute_qf(state, pool, max_reward, redistribute_caps=True):
     return total_mc, cap
 
 
-def _simulated_state_with_extra_donors(state, target_index, donor_amount, donor_count):
+def _simulated_state_with_extra_donors(state, target_index, donor_amount, donor_count, qf_formula="giveth"):
     simulated = deepcopy(state)
     target = simulated[target_index]
     sqrt_sum = target.get("sqrt_sum", 0.0) + donor_count * math.sqrt(donor_amount)
     effective_linear = target.get("boosted_linear", 0.0) + donor_count * donor_amount
     target["sqrt_sum"] = sqrt_sum
     target["boosted_linear"] = effective_linear
-    target["match_component"] = max(sqrt_sum * sqrt_sum - effective_linear, 0.0)
+    if qf_formula == "standard":
+        target["match_component"] = max(sqrt_sum * sqrt_sum - effective_linear, 0.0)
+    else:
+        target["match_component"] = sqrt_sum * sqrt_sum
     target["raised"] = target.get("raised", 0.0) + donor_count * donor_amount
     target["donors"] = target.get("donors", 0) + donor_count
     return simulated
 
 
-def find_min_donors_for_cap(state, target_index, donor_amount, pool, max_reward, redistribute_caps=True):
+def find_min_donors_for_cap(state, target_index, donor_amount, pool, max_reward, redistribute_caps=True, qf_formula="giveth"):
     if donor_amount <= 0:
         return None
     cap = pool * max_reward
 
     def match_with(n):
-        simulated = _simulated_state_with_extra_donors(state, target_index, donor_amount, n)
+        simulated = _simulated_state_with_extra_donors(state, target_index, donor_amount, n, qf_formula=qf_formula)
         compute_qf(simulated, pool, max_reward, redistribute_caps=redistribute_caps)
         return simulated[target_index].get("match", 0.0)
 
@@ -582,7 +651,9 @@ def parse_args():
     p.add_argument("--nft-contract", default=NFT_CONTRACT, help="ERC-721 contract address for NFT holder boost.")
     p.add_argument("--nft-multiplier", type=float, default=NFT_MULTIPLIER, help="QF contribution multiplier for NFT holders.")
     p.add_argument("--no-nft-boost", action="store_true", help="Disable NFT holder QF multiplier.")
+    p.add_argument("--qf-formula", choices=["standard", "giveth"], default="giveth", help="QF matching formula. 'giveth' matches Giveth's open-source estimation code (uses (sum sqrt)^2 directly). 'standard' uses classic QF (subtracts linear sum).")
     p.add_argument("--no-cap-redistribution", action="store_true", help="Use old clamp-only cap behavior; mainly for comparison.")
+    p.add_argument("--workers", type=int, default=1, help="Parallel donation-fetch workers (default 1). Values > 1 use threads; be kind to the API.")
     p.add_argument("--retry-initial-sleep", type=float, default=RETRY_INITIAL_SLEEP, help="Seconds before the first transient API retry.")
     p.add_argument("--retry-max-sleep", type=float, default=RETRY_MAX_SLEEP, help="Maximum seconds between transient API retries.")
     p.add_argument("--self-test", action="store_true", help="Run deterministic offline tests and exit.")
@@ -680,7 +751,7 @@ def run_self_tests():
     finally:
         ETH_USD_PRICE = old_eth_price
 
-    # NFT multiplier is applied as an effective contribution, preserving the single-donor zero-match invariant.
+    # NFT multiplier is applied as an effective contribution, preserving the single-donor zero-match invariant for STANDARD QF.
     state = [
         {
             "title": "NFT single donor",
@@ -690,7 +761,20 @@ def run_self_tests():
             "match_component": max(math.sqrt(40.0) ** 2 - 40.0, 0.0),
         }
     ]
-    _assert_close(state[0]["match_component"], 0.0, "NFT single donor no match")
+    _assert_close(state[0]["match_component"], 0.0, "NFT single donor no match standard")
+
+    # Giveth formula: single donor still receives matching (proportional to contribution)
+    giveth_state = [
+        {
+            "title": "NFT single donor giveth",
+            "raised": 10.0,
+            "sqrt_sum": math.sqrt(40.0),
+            "boosted_linear": 40.0,
+            "match_component": math.sqrt(40.0) ** 2,
+        }
+    ]
+    compute_qf(giveth_state, 100.0, 1.0)
+    _assert_close(giveth_state[0]["match"], 100.0, "giveth single donor gets full pool")
 
     # Transient HTTP 503 retries indefinitely until the same request succeeds.
     old_urlopen = urllib.request.urlopen
@@ -809,6 +893,10 @@ def main():
         nft_multiplier=nft_multiplier,
         track_currencies=track if not args.no_currency_stats else (),
         progress=progress,
+        qf_formula=args.qf_formula,
+        begin_date=round_meta.get("beginDate"),
+        end_date=round_meta.get("endDate"),
+        workers=args.workers,
     )
     redistribute_caps = not args.no_cap_redistribution
     total_mc, cap = compute_qf(state, pool, max_reward, redistribute_caps=redistribute_caps)
@@ -825,6 +913,7 @@ def main():
     print(f"Round: {round_meta.get('name')} ({round_meta.get('beginDate')} to {round_meta.get('endDate')})")
     print(f"  Round id: {round_id} | Slug: {round_meta.get('slug')}")
     print(f"  Pool source: {pool_source} | Cap source: round.maximumReward")
+    print(f"  QF formula: {args.qf_formula}")
     if pool_native_amount is not None and pool_native_symbol in {"ETH", "WETH"}:
         print(
             f"  Pool: {pool_native_amount:,.6g} {pool_native_symbol} (~{fmt_money(pool)}) | "
@@ -872,7 +961,7 @@ def main():
                     target_index = next(i for i, candidate in enumerate(state) if candidate is s)
                     row = f"{truncate(s['title'], 25):25}"
                     for amt in tiers:
-                        n = find_min_donors_for_cap(state, target_index, amt, pool, max_reward, redistribute_caps=redistribute_caps)
+                        n = find_min_donors_for_cap(state, target_index, amt, pool, max_reward, redistribute_caps=redistribute_caps, qf_formula=args.qf_formula)
                         row += f" {(str(n) if n is not None else 'N/A'):>8}"
                     print(row)
 
@@ -883,9 +972,13 @@ def main():
             print(f"  {cur}: {d['amount']:,.2f} {cur} | {d['count']} donations | {len(d['donors'])} unique donors (cluster-deduped)")
 
     print()
+    formula_label = "Standard QF" if args.qf_formula == "standard" else "Giveth estimation"
     notes = (
-        "Note: estimate from current donation snapshot. Final Giveth payout may apply COCM, "
-        "Passport/Sybil weighting, manual exclusions, and post-round review. Anonymous donations clustered by 1-minute timestamp."
+        f"Note: estimate from current donation snapshot using {formula_label} logic. "
+        "Final Giveth payout may apply COCM (Connection-Oriented Cluster Matching), "
+        "Passport/Sybil weighting, manual exclusions, and post-round review. "
+        "Anonymous donations without a userId are clustered by 1-minute timestamp; "
+        "Giveth's backend may exclude truly anonymous donations entirely."
     )
     if nft_holders:
         notes += f" NFT holder contributions boosted {nft_multiplier}x in QF matching."
